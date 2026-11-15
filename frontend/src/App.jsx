@@ -23,7 +23,7 @@ const api = async (path, options = {}, token) => {
 // Status labels used for any metric: green = in range, amber = review, red = needs attention.
 // Each metric also has user-facing text explaining why it matters, how to measure it, and spaceflight context.
 const STATUS = ['In range', 'Check again', 'Needs attention']
-const SENSOR_READING_MAX_AGE_MS = 5000
+const SENSOR_READING_MAX_AGE_MS = 35000
 
 // Sensor history remains saved, but readings older than this are not shown as live values.
 function isFreshSensorRecord(record) {
@@ -378,7 +378,7 @@ function Record({ cfg, token, records, onDone }) {
           </div>
           {key === 'hr' && inputMode === 'sensor' && <div className="measure-range">
             {sensorConnected
-              ? <>Latest reading received {latestSensorRecord.ts.replace('T', ' · ')}. Each detected BPM update is saved automatically.</>
+              ? <>Latest 30-second average received {latestSensorRecord.ts.replace('T', ' · ')}. A new sensor average is saved every 30 seconds.</>
               : latestSensorRecord
                 ? <>No fresh sensor signal. Last reading was {latestSensorRecord.ts.replace('T', ' · ')}.</>
                 : 'No sensor reading yet. Connect the Arduino and run the serial bridge.'}

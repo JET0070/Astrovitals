@@ -13,6 +13,12 @@ const int minPulseAmplitude = 35;
 // Reject saturated/clipped signals (ADC is 0-1023).
 const int maxPulseAmplitude = 900;
 
+// Keep in sync with the heart-rate range accepted by the app and API.
+const int minBpm = 30;
+const int maxBpm = 180;
+const unsigned long minIntervalMs = 60000UL / maxBpm;
+const unsigned long maxIntervalMs = 60000UL / minBpm;
+
 const int intervalHistorySize = 5;
 const int stableIntervalsRequired = 5;     // consecutive good beats before output
 const unsigned long maxSpreadPercent = 30; // max (longest - shortest) / average
@@ -31,9 +37,9 @@ volatile unsigned long lastBeatTime = 0;
 volatile int P = 512;
 volatile int T = 512;
 volatile int thresh = 525;
-volatile int amp = 100;
-volatile int completedPulseAmplitude = 0;
 volatile boolean firstBeat = true;
+volatile unsigned long pendingInterval = 0;
+volatile unsigned long lastQualifiedBeatTime = 0;
 volatile unsigned int intervalHistory[intervalHistorySize];
 volatile int intervalCount = 0;
 volatile int intervalIndex = 0;
@@ -47,6 +53,10 @@ unsigned int bpmCount = 0;
 void setup() {
   pinMode(blinkPin, OUTPUT);
   Serial.begin(115200);
+  Signal = analogRead(pulsePin);
+  P = Signal;
+  T = Signal;
+  thresh = Signal;
   measurementWindowStart = millis();
   interruptSetup();
 }
@@ -69,7 +79,7 @@ void loop() {
     const int bpm = BPM;
     newValidBeat = false;
     interrupts();
-    if (bpm >= 30 && bpm <= 180) {
+    if (bpm >= minBpm && bpm <= maxBpm) {
       lastValidMs = millis();
       bpmTotal += bpm;
       bpmCount++;
@@ -104,15 +114,18 @@ void interruptSetup() {
 
 // Clears everything so a fresh lock is required.
 static void resetDetector() {
-  thresh = 512;
-  P = 512;
-  T = 512;
+  thresh = Signal;
+  P = Signal;
+  T = Signal;
   BPM = 0;
+  newValidBeat = false;
+  IBI = 600;
   lastBeatTime = sampleCounter;
+  lastQualifiedBeatTime = sampleCounter;
   firstBeat = true;
+  pendingInterval = 0;
   intervalCount = 0;
   intervalIndex = 0;
-  completedPulseAmplitude = 0;
   Pulse = false;
   digitalWrite(blinkPin, LOW);
 }
@@ -136,65 +149,66 @@ ISR(TIMER2_COMPA_vect) {
     digitalWrite(blinkPin, HIGH);
     const unsigned long candidate = sampleCounter - lastBeatTime;
     lastBeatTime = sampleCounter;
+    pendingInterval = firstBeat ? 0 : candidate;
+    firstBeat = false;
+  }
 
-    if (firstBeat) {
-      // First beat only gives us a time reference, no valid interval yet.
-      firstBeat = false;
-      return;
-    }
+  // Validate the pulse amplitude at its falling edge before accepting its interval.
+  if (Signal < thresh && Pulse) {
+    digitalWrite(blinkPin, LOW);
+    Pulse = false;
+    const int pulseAmplitude = P > T ? P - T : 0;
+    thresh = pulseAmplitude / 2 + T;
+    P = thresh;
+    T = thresh;
 
-    const bool amplitudeOk = completedPulseAmplitude >= minPulseAmplitude &&
-                             completedPulseAmplitude <= maxPulseAmplitude;
-    if (candidate >= 333 && candidate <= 2000 && amplitudeOk) {
-      IBI = (int)candidate;
-      intervalHistory[intervalIndex] = (unsigned int)candidate;
-      intervalIndex = (intervalIndex + 1) % intervalHistorySize;
-      if (intervalCount < intervalHistorySize) {
-        intervalCount++;
-      }
-    } else {
-      // Require consecutive in-range intervals with adequate pulse amplitude.
+    const unsigned long candidate = pendingInterval;
+    pendingInterval = 0;
+    const bool amplitudeOk = pulseAmplitude >= minPulseAmplitude &&
+                             pulseAmplitude <= maxPulseAmplitude;
+    if (!amplitudeOk) {
       intervalCount = 0;
       intervalIndex = 0;
-    }
-
-    if (intervalCount >= stableIntervalsRequired) {
-      unsigned int shortest = 65535;
-      unsigned int longest = 0;
-      unsigned long total = 0;
-      for (int i = 0; i < intervalCount; i++) {
-        const unsigned int v = intervalHistory[i];
-        if (v < shortest) shortest = v;
-        if (v > longest) longest = v;
-        total += v;
+      firstBeat = true;
+    } else {
+      lastQualifiedBeatTime = sampleCounter;
+      if (candidate > 0) {
+        if (candidate >= minIntervalMs && candidate <= maxIntervalMs) {
+          IBI = (int)candidate;
+          intervalHistory[intervalIndex] = (unsigned int)candidate;
+          intervalIndex = (intervalIndex + 1) % intervalHistorySize;
+          if (intervalCount < intervalHistorySize) {
+            intervalCount++;
+          }
+        }
       }
-      const unsigned long average = total / intervalCount;
-      const bool stable = (longest - shortest) <= (average * maxSpreadPercent / 100UL);
 
-      if (stable && amplitudeOk && average > 0) {
-        // BPM comes from the same validated intervals used by the stability check.
-        const int bpm = (int)(60000UL / average);
-        if (bpm >= 30 && bpm <= 180) {
-          BPM = bpm;
-          newValidBeat = true;
+      if (intervalCount >= stableIntervalsRequired) {
+        unsigned int shortest = 65535;
+        unsigned int longest = 0;
+        unsigned long total = 0;
+        for (int i = 0; i < intervalCount; i++) {
+          const unsigned int v = intervalHistory[i];
+          if (v < shortest) shortest = v;
+          if (v > longest) longest = v;
+          total += v;
+        }
+        const unsigned long average = total / intervalCount;
+        const bool stable = (longest - shortest) <= (average * maxSpreadPercent / 100UL);
+
+        if (stable && average > 0) {
+          const int bpm = (int)(60000UL / average);
+          if (bpm >= minBpm && bpm <= maxBpm) {
+            BPM = bpm;
+            newValidBeat = true;
+          }
         }
       }
     }
   }
 
-  // Falling edge: end of pulse, update amplitude and adaptive threshold.
-  if (Signal < thresh && Pulse) {
-    digitalWrite(blinkPin, LOW);
-    Pulse = false;
-    amp = P - T;
-    completedPulseAmplitude = amp;
-    thresh = amp / 2 + T;
-    P = thresh;
-    T = thresh;
-  }
-
-  // No beat for 2.5 s: discard everything and require a fresh lock.
-  if (N > 2500) {
+  // Noise crossings do not keep the detector alive without qualified pulses.
+  if (sampleCounter - lastQualifiedBeatTime > 2500) {
     resetDetector();
   }
 }
