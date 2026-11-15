@@ -22,9 +22,9 @@ const unsigned long maxIntervalMs = 60000UL / minBpm;
 const int intervalHistorySize = 5;
 const int stableIntervalsRequired = 5;     // consecutive good beats before output
 const unsigned long maxSpreadPercent = 30; // max (longest - shortest) / average
+const unsigned int minWindowSamples = 5;    // reject windows with only a few isolated detections
 
 const unsigned long measurementWindowMs = 30000;
-const unsigned long signalTimeoutMs = 3000; // no valid beat for this long -> null
 
 // ---------------- Shared state (ISR <-> loop) ----------------
 volatile int BPM = 0;            // last validated BPM, 0 = none
@@ -46,7 +46,6 @@ volatile int intervalIndex = 0;
 
 // ---------------- Loop-side state ----------------
 unsigned long measurementWindowStart = 0;
-unsigned long lastValidMs = 0;
 unsigned long bpmTotal = 0;
 unsigned int bpmCount = 0;
 
@@ -80,7 +79,6 @@ void loop() {
     newValidBeat = false;
     interrupts();
     if (bpm >= minBpm && bpm <= maxBpm) {
-      lastValidMs = millis();
       bpmTotal += bpm;
       bpmCount++;
     }
@@ -88,7 +86,7 @@ void loop() {
 
   if (millis() - measurementWindowStart >= measurementWindowMs) {
     const unsigned long now = millis();
-    const bool ok = bpmCount > 0 && (now - lastValidMs) < signalTimeoutMs;
+    const bool ok = bpmCount >= minWindowSamples;
     Serial.print("{\"hr\":");
     if (ok) {
       Serial.print((bpmTotal + bpmCount / 2) / bpmCount);
@@ -180,6 +178,10 @@ ISR(TIMER2_COMPA_vect) {
           if (intervalCount < intervalHistorySize) {
             intervalCount++;
           }
+        } else {
+          intervalCount = 0;
+          intervalIndex = 0;
+          firstBeat = true;
         }
       }
 

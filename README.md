@@ -18,7 +18,9 @@ Arduino sketch:
     board (for example Arduino Uno), select the board's port, and upload. The sketch averages qualified BPM
     readings over 30 seconds, then sends one JSON line such as {"hr": 72} and immediately starts the next window.
     It validates each pulse's amplitude and interval, and requires five stable intervals before reporting.
-    If no recent valid pulse is detected, it sends {"hr": null}.
+    It accepts 30–180 BPM as a broad software plausibility range, not a normal resting range, and ignores
+    out-of-range intervals. A window needs at least five validated BPM samples; otherwise it sends {"hr": null}.
+    With DEBUG_RAW set to 1, the sketch instead outputs raw signal samples about 50 times per second, not BPM.
 
 Keep the Arduino Serial Monitor closed while the bridge is running because only one program can use the serial port.
 The Check-in page refreshes sensor readings automatically. Its heart-rate source switch affects only resting heart
