@@ -9,9 +9,13 @@ Arduino / sensor bridge (optional; keep the API running in Terminal 1):
     python -m pip install -r requirements.txt
     python sensor_bridge.py --user astronaut
 
-The bridge asks for the account password securely, auto-detects the Arduino's serial port, and saves each 30-second
-average. If auto-detection selects the wrong port, specify it with --port COM3 (use the port shown in Arduino IDE >
-Tools > Port). The API must be running at http://127.0.0.1:8000 or the bridge will report connection errors.
+The bridge asks for the account password securely, auto-detects a uniquely identifiable Arduino USB serial port, and
+saves each 30-second average. If there are multiple candidate ports, specify the exact one shown in Arduino IDE >
+Tools > Port (for example, `python sensor_bridge.py --port COM10 --user astronaut`). The API must be running at
+http://127.0.0.1:8000 or the bridge will report connection errors.
+When the Arduino sketch has `DEBUG_STATUS` set to 1 and `DEBUG_RAW` set to 0, the bridge forwards its one-per-second
+diagnostic counters to the Check-in page's Sensor view. These temporary diagnostics are displayed for troubleshooting
+and are not stored as health records.
 
 Arduino sketch:
     Open arduino/PulseSensorAstroVitals/PulseSensorAstroVitals.ino in Arduino IDE, select a compatible ATmega328P

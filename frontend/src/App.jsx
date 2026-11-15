@@ -318,6 +318,46 @@ function Record({ cfg, token, records, onDone }) {
   const [error, setError] = useState('')
   const [result, setResult] = useState(null)
   const [busy, setBusy] = useState(false)
+  const [sensorStatus, setSensorStatus] = useState(null)
+  const [sensorStatusError, setSensorStatusError] = useState('')
+  useEffect(() => {
+    if (inputMode !== 'sensor') return undefined
+    let active = true
+    let timer
+    const refreshStatus = async () => {
+      try {
+        const status = await api('/sensor-status', {}, token)
+        if (active) {
+          setSensorStatus(status.sig === undefined ? null : status)
+          setSensorStatusError('')
+        }
+      } catch (requestError) {
+        if (active) setSensorStatusError(requestError.message)
+      } finally {
+        if (active) timer = window.setTimeout(refreshStatus, 1000)
+      }
+    }
+    refreshStatus()
+    return () => {
+      active = false
+      window.clearTimeout(timer)
+    }
+  }, [inputMode, token])
+  const sensorStatusAge = sensorStatus?.ts ? Date.now() - new Date(sensorStatus.ts).getTime() : NaN
+  const sensorStatusFresh = Number.isFinite(sensorStatusAge) && sensorStatusAge >= 0 && sensorStatusAge <= 5000
+  const sensorHint = !sensorStatusFresh
+    ? 'Waiting for Arduino diagnostic status. Keep the bridge running, set DEBUG_STATUS to 1, and keep DEBUG_RAW at 0.'
+    : sensorStatus.beats === 0
+      ? 'No pulse crossings detected yet. Check sensor power, ground, signal wiring to A0, and finger contact.'
+      : sensorStatus.rejAmp > 0 && sensorStatus.lock === 0
+        ? 'Pulses are being detected but rejected for signal amplitude. Check stable contact; use the raw plot to tune minPulseAmplitude.'
+        : sensorStatus.rejIvl > 0 && sensorStatus.lock === 0
+          ? 'Pulses are being detected but their intervals are outside the accepted 30–180 BPM range.'
+          : sensorStatus.unstable > 0 && sensorStatus.lock < 5
+            ? 'Beat timing is too variable to lock. Hold your finger and sensor still.'
+            : sensorStatus.lock < 5
+              ? `Detecting beats; stable interval lock is ${sensorStatus.lock}/5. Keep still and wait for a steady pulse.`
+              : 'Stable beat lock acquired. The sketch will report an average after enough valid samples in its 30-second window.'
   const setLastValues = () => setValues(Object.fromEntries(Object.entries(last).map(([key, value]) => [key, String(value)])))
   const submit = async event => {
     event.preventDefault()
@@ -360,6 +400,29 @@ function Record({ cfg, token, records, onDone }) {
         <div><h2>Today’s indicators</h2><p className="muted">Use onboard equipment and your mission logs. Reference bands are simplified cues, not individualized medical limits.</p></div>
         {Object.keys(last).length > 0 && <button className="quiet-button" type="button" onClick={setLastValues}>Use last values to recheck</button>}
       </div>
+      {inputMode === 'sensor' && <section className="sensor-debug" aria-live="polite">
+        <div className="section-heading">
+          <div><div className="eyebrow">LIVE ARDUINO DIAGNOSTICS</div><h3>Sensor signal checks</h3></div>
+          <span className={`sensor-live-dot ${sensorStatusFresh ? 'sensor-live' : ''}`}>{sensorStatusFresh ? 'Live' : 'Waiting'}</span>
+        </div>
+        <p>{sensorStatusError || sensorHint}</p>
+        {sensorStatusFresh && <div className="sensor-debug-grid">
+          {[
+            ['Signal', sensorStatus.sig],
+            ['Threshold', sensorStatus.thr],
+            ['Beat starts', sensorStatus.beats],
+            ['Last amplitude', sensorStatus.amp],
+            ['Last interval', `${sensorStatus.ivl} ms`],
+            ['Stable lock', `${sensorStatus.lock}/5`],
+            ['Amplitude rejects', sensorStatus.rejAmp],
+            ['Interval rejects', sensorStatus.rejIvl],
+            ['Unstable beats', sensorStatus.unstable],
+            ['Valid BPM updates', sensorStatus.valid],
+            ['Detector resets', sensorStatus.resets],
+          ].map(([label, value]) => <div key={label}><span>{label}</span><b>{value}</b></div>)}
+        </div>}
+        <small>Diagnostics update about once per second and are not saved as health records.</small>
+      </section>}
       <div className="measure-grid">{Object.entries(cfg).map(([key, setting]) => {
         const info = METRIC_INFO[key]
         const enteredValue = values[key]

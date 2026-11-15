@@ -31,22 +31,49 @@ except ImportError:
 
 def auto_detect_port():
     if list_ports is None:
-        return "COM3"
+        raise RuntimeError("pyserial port discovery is unavailable; install it with: pip install pyserial")
 
     ports = list(list_ports.comports())
     if not ports:
-        return "COM3"
+        raise RuntimeError("No serial ports found. Connect the Arduino and check Tools > Port in Arduino IDE.")
 
-    preferred = []
-    for port in ports:
-        name = getattr(port, "device", str(port))
-        lower = name.lower()
-        if any(token in lower for token in ("arduino", "usbserial", "ttyusb", "ttyacm", "com")):
-            preferred.append(name)
+    def description(port):
+        return " ".join(
+            str(value or "")
+            for value in (port.description, port.manufacturer, port.product, port.hwid)
+        ).lower()
 
-    if preferred:
-        return preferred[0]
-    return ports[0].device
+    named_arduino = [p for p in ports if "arduino" in description(p)]
+    if len(named_arduino) == 1:
+        return named_arduino[0].device
+    if len(named_arduino) > 1:
+        ports = named_arduino
+    else:
+        usb_serial = [
+            p for p in ports
+            if p.vid is not None
+            and any(token in description(p) for token in (
+                "usb", "serial", "ch340", "cp210", "ftdi", "uart",
+            ))
+            and not any(token in description(p) for token in (
+                "bluetooth", "active management", "intel",
+            ))
+        ]
+        if len(usb_serial) == 1:
+            return usb_serial[0].device
+        if usb_serial:
+            ports = usb_serial
+        else:
+            raise RuntimeError(
+                "Could not identify an Arduino USB serial port. "
+                "Specify the port shown in Arduino IDE > Tools > Port with --port."
+            )
+
+    choices = ", ".join(f"{p.device} ({p.description})" for p in ports)
+    raise RuntimeError(
+        f"More than one possible Arduino port was found: {choices}. "
+        "Specify the correct one with --port."
+    )
 
 
 def login(server_url, username, password):
@@ -68,6 +95,36 @@ def send_sensor_values(server_url, token, values):
     payload = json.dumps({"mode": "sensor", "values": values}).encode()
     req = request.Request(
         f"{server_url}/api/records",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": token,
+        },
+        method="POST",
+    )
+    with request.urlopen(req, timeout=10) as response:
+        return json.loads(response.read().decode())
+
+
+def parse_status_line(line):
+    text = (line or "").strip()
+    if not text.startswith("#"):
+        return {}
+    status = {
+        key: int(value)
+        for key, value in re.findall(r"\b([A-Za-z]+)=(-?\d+)\b", text)
+    }
+    expected = {
+        "sig", "thr", "beats", "amp", "ivl", "lock", "rejAmp",
+        "rejIvl", "unstable", "valid", "resets",
+    }
+    return {key: value for key, value in status.items() if key in expected}
+
+
+def send_sensor_status(server_url, token, status):
+    payload = json.dumps({"status": status}).encode()
+    req = request.Request(
+        f"{server_url}/api/sensor-status",
         data=payload,
         headers={
             "Content-Type": "application/json",
@@ -124,7 +181,11 @@ def main():
         return 1
 
     if args.port.upper() == "AUTO":
-        args.port = auto_detect_port()
+        try:
+            args.port = auto_detect_port()
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
         print(f"Auto-detected serial port: {args.port}")
 
     if not args.token:
@@ -148,7 +209,18 @@ def main():
                 line = port.readline()
                 if not line:
                     continue
-                values = parse_line(line.decode(errors="ignore"))
+                text = line.decode(errors="ignore")
+                status = parse_status_line(text)
+                if status:
+                    try:
+                        send_sensor_status(args.server, args.token, status)
+                    except error.HTTPError as exc:
+                        payload = exc.read().decode(errors="ignore")
+                        print(f"Status update failed: {exc.code} {payload}", file=sys.stderr)
+                    except Exception as exc:
+                        print(f"Status update failed: {exc}", file=sys.stderr)
+                    continue
+                values = parse_line(text)
                 if not values:
                     continue
                 try:

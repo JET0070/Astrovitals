@@ -7,6 +7,7 @@ from urllib.parse import parse_qs, urlsplit
 DB = "astro.db"
 # In-memory login sessions. Each token maps to a user id and is cleared when the server restarts.
 TOKENS = {}  # token -> user_id (in memory, cleared on restart)
+SENSOR_STATUS = {}  # user_id -> latest transient Arduino diagnostic status
 
 # Helper to build a metric definition object.
 # Each key stores:
@@ -196,6 +197,28 @@ class H(BaseHTTPRequestHandler):
 
             # All routes below require a valid auth token.
             if not u: return self.send(401, {"error": "Login required"})
+
+            # /api/sensor-status GET/POST: transient Arduino diagnostics, not health records.
+            if p == "/api/sensor-status" and m == "GET":
+                return self.send(200, SENSOR_STATUS.get(u, {}))
+            if p == "/api/sensor-status" and m == "POST":
+                b = self.body()
+                incoming = b.get("status")
+                if not isinstance(incoming, dict):
+                    return self.send(400, {"error": "Expected a sensor status object"})
+                allowed = {
+                    "sig", "thr", "beats", "amp", "ivl", "lock", "rejAmp",
+                    "rejIvl", "unstable", "valid", "resets",
+                }
+                status = {
+                    key: value for key, value in incoming.items()
+                    if key in allowed and isinstance(value, int) and not isinstance(value, bool)
+                }
+                if not status:
+                    return self.send(400, {"error": "No valid sensor diagnostic counters provided"})
+                status["ts"] = dt.datetime.now().isoformat(timespec="seconds")
+                SENSOR_STATUS[u] = status
+                return self.send(200, status)
 
             # /api/records GET: return all saved health records for this user.
             # Optional after=<record id> returns only records added after that id for efficient live updates.

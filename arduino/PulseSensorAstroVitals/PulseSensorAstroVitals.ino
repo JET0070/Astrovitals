@@ -3,12 +3,14 @@
 // ---------------- Configuration ----------------
 // Set to 1 to stream the raw signal (for Arduino Serial Plotter) instead of JSON.
 #define DEBUG_RAW 0
+// Set to 1 to print one "#..." status line per second showing which gate rejects beats.
+// The web app must ignore lines starting with '#'. Set back to 0 when done.
+#define DEBUG_STATUS 1
 
 const int pulsePin = A0;
 const int blinkPin = 13;
 
-// Tune against the real sensor using DEBUG_RAW: set it to roughly 40-50% of the
-// peak-to-peak amplitude you see with a finger on the sensor.
+// Tune against the real sensor using DEBUG_RAW / DEBUG_STATUS (amp= field).
 const int minPulseAmplitude = 35;
 // Reject saturated/clipped signals (ADC is 0-1023).
 const int maxPulseAmplitude = 900;
@@ -22,7 +24,8 @@ const unsigned long maxIntervalMs = 60000UL / minBpm;
 const int intervalHistorySize = 5;
 const int stableIntervalsRequired = 5;     // consecutive good beats before output
 const unsigned long maxSpreadPercent = 30; // max (longest - shortest) / average
-const unsigned int minWindowSamples = 5;    // reject windows with only a few isolated detections
+const unsigned int minWindowSamples = 5;   // reject windows with only a few isolated detections
+const int maxBadPulsesBeforeReset = 3;     // consecutive bad pulses before the lock is wiped
 
 const unsigned long measurementWindowMs = 30000;
 
@@ -43,6 +46,17 @@ volatile unsigned long lastQualifiedBeatTime = 0;
 volatile unsigned int intervalHistory[intervalHistorySize];
 volatile int intervalCount = 0;
 volatile int intervalIndex = 0;
+volatile int badPulseStreak = 0;
+
+// Debug counters (written by the ISR, read by loop with interrupts off).
+volatile unsigned int dbgRising = 0;    // threshold crossings accepted as a beat start
+volatile unsigned int dbgRejAmp = 0;    // pulses rejected: amplitude out of range
+volatile unsigned int dbgRejIvl = 0;    // pulses rejected: interval out of range
+volatile unsigned int dbgUnstable = 0;  // lock complete but intervals too spread out
+volatile unsigned int dbgValid = 0;     // validated BPM outputs
+volatile unsigned int dbgResets = 0;    // full detector resets (timeout or bad streak)
+volatile int dbgAmp = 0;                // amplitude of the last pulse
+volatile unsigned long dbgIvl = 0;      // last candidate interval (ms)
 
 // ---------------- Loop-side state ----------------
 unsigned long measurementWindowStart = 0;
@@ -84,6 +98,30 @@ void loop() {
     }
   }
 
+#if DEBUG_STATUS
+  static unsigned long lastStatus = 0;
+  if (millis() - lastStatus >= 1000) {
+    lastStatus = millis();
+    noInterrupts();
+    const unsigned int rising = dbgRising, rejAmp = dbgRejAmp, rejIvl = dbgRejIvl;
+    const unsigned int unstable = dbgUnstable, valid = dbgValid, resets = dbgResets;
+    const int amp = dbgAmp, sig = Signal, th = thresh, cnt = intervalCount;
+    const unsigned long ivl = dbgIvl;
+    interrupts();
+    Serial.print("#sig="); Serial.print(sig);
+    Serial.print(" thr="); Serial.print(th);
+    Serial.print(" beats="); Serial.print(rising);
+    Serial.print(" amp="); Serial.print(amp);
+    Serial.print(" ivl="); Serial.print(ivl);
+    Serial.print(" lock="); Serial.print(cnt);
+    Serial.print(" rejAmp="); Serial.print(rejAmp);
+    Serial.print(" rejIvl="); Serial.print(rejIvl);
+    Serial.print(" unstable="); Serial.print(unstable);
+    Serial.print(" valid="); Serial.print(valid);
+    Serial.print(" resets="); Serial.println(resets);
+  }
+#endif
+
   if (millis() - measurementWindowStart >= measurementWindowMs) {
     const unsigned long now = millis();
     const bool ok = bpmCount >= minWindowSamples;
@@ -102,7 +140,8 @@ void loop() {
 }
 
 void interruptSetup() {
-  // Timer2 compare interrupt at 500 Hz (one sample every 2 ms), for ATmega328P boards.
+  // Timer2 compare interrupt at 500 Hz (one sample every 2 ms), for ATmega328P boards
+  // running at 16 MHz. On an 8 MHz board this runs at 250 Hz and all timings double.
   TCCR2A = 0x02;
   TCCR2B = 0x06;
   OCR2A = 0x7C;
@@ -124,8 +163,22 @@ static void resetDetector() {
   pendingInterval = 0;
   intervalCount = 0;
   intervalIndex = 0;
+  badPulseStreak = 0;
   Pulse = false;
   digitalWrite(blinkPin, LOW);
+  dbgResets++;
+}
+
+// A bad pulse is ignored; only a streak of them wipes the lock.
+static void registerBadPulse() {
+  badPulseStreak++;
+  if (badPulseStreak >= maxBadPulsesBeforeReset) {
+    intervalCount = 0;
+    intervalIndex = 0;
+    firstBeat = true;
+    badPulseStreak = 0;
+    dbgResets++;
+  }
 }
 
 ISR(TIMER2_COMPA_vect) {
@@ -149,6 +202,7 @@ ISR(TIMER2_COMPA_vect) {
     lastBeatTime = sampleCounter;
     pendingInterval = firstBeat ? 0 : candidate;
     firstBeat = false;
+    dbgRising++;
   }
 
   // Validate the pulse amplitude at its falling edge before accepting its interval.
@@ -159,17 +213,19 @@ ISR(TIMER2_COMPA_vect) {
     thresh = pulseAmplitude / 2 + T;
     P = thresh;
     T = thresh;
+    dbgAmp = pulseAmplitude;
 
     const unsigned long candidate = pendingInterval;
     pendingInterval = 0;
+    if (candidate > 0) dbgIvl = candidate;
     const bool amplitudeOk = pulseAmplitude >= minPulseAmplitude &&
                              pulseAmplitude <= maxPulseAmplitude;
     if (!amplitudeOk) {
-      intervalCount = 0;
-      intervalIndex = 0;
-      firstBeat = true;
+      dbgRejAmp++;
+      registerBadPulse();
     } else {
       lastQualifiedBeatTime = sampleCounter;
+      bool intervalOk = true;
       if (candidate > 0) {
         if (candidate >= minIntervalMs && candidate <= maxIntervalMs) {
           IBI = (int)candidate;
@@ -179,13 +235,14 @@ ISR(TIMER2_COMPA_vect) {
             intervalCount++;
           }
         } else {
-          intervalCount = 0;
-          intervalIndex = 0;
-          firstBeat = true;
+          intervalOk = false;
+          dbgRejIvl++;
+          registerBadPulse();
         }
       }
+      if (intervalOk) badPulseStreak = 0;
 
-      if (intervalCount >= stableIntervalsRequired) {
+      if (intervalOk && intervalCount >= stableIntervalsRequired) {
         unsigned int shortest = 65535;
         unsigned int longest = 0;
         unsigned long total = 0;
@@ -198,11 +255,14 @@ ISR(TIMER2_COMPA_vect) {
         const unsigned long average = total / intervalCount;
         const bool stable = (longest - shortest) <= (average * maxSpreadPercent / 100UL);
 
-        if (stable && average > 0) {
+        if (!stable) {
+          dbgUnstable++;
+        } else if (average > 0) {
           const int bpm = (int)(60000UL / average);
           if (bpm >= minBpm && bpm <= maxBpm) {
             BPM = bpm;
             newValidBeat = true;
+            dbgValid++;
           }
         }
       }
